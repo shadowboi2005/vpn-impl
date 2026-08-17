@@ -10,6 +10,7 @@
 #include "relay.h"
 #include "tun.h"
 #include "udp.h"
+#include "wire.h"
 
 namespace {
 
@@ -18,7 +19,7 @@ void usage(const char* program) {
                  "usage: %s [options]\n"
                  "  --dev NAME          tun device name (default tun0)\n"
                  "  --tun-addr CIDR     tunnel address (default 10.9.0.1/24)\n"
-                 "  --mtu N             tunnel MTU, 576..1500 (default 1380)\n"
+                 "  --mtu N             tunnel MTU, 576..1500 (default 1420)\n"
                  "  --listen-port N     udp port to bind (default 51820)\n"
                  "  --wan-if NAME       interface to masquerade out of\n"
                  "                      (default: whichever reaches the internet)\n"
@@ -32,7 +33,7 @@ int main(int argc, char** argv) {
     std::string dev = "tun0";
     std::string tun_addr = "10.9.0.1/24";
     std::string wan_if;
-    int mtu = 1380;
+    int mtu = vpn::wire::kDefaultTunnelMtu;
     uint16_t listen_port = 51820;
     bool install_nat = true;
 

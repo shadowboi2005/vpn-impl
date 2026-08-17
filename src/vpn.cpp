@@ -11,6 +11,7 @@
 #include "relay.h"
 #include "tun.h"
 #include "udp.h"
+#include "wire.h"
 
 namespace {
 
@@ -20,7 +21,7 @@ void usage(const char* program) {
                  "  --server IP:PORT    vpn server endpoint (required)\n"
                  "  --dev NAME          tun device name (default tun0)\n"
                  "  --tun-addr CIDR     tunnel address (default 10.9.0.2/24)\n"
-                 "  --mtu N             tunnel MTU, 576..1500 (default 1380)\n"
+                 "  --mtu N             tunnel MTU, 576..1500 (default 1420)\n"
                  "  --listen-port N     local udp port (default 0, ephemeral)\n"
                  "  --no-routes         do not touch the routing table\n"
                  "  --host-ipv6 MODE    what to do if this host has working IPv6:\n"
@@ -33,7 +34,7 @@ void usage(const char* program) {
 int main(int argc, char** argv) {
     std::string dev = "tun0";
     std::string tun_addr = "10.9.0.2/24";
-    int mtu = 1380;
+    int mtu = vpn::wire::kDefaultTunnelMtu;
     uint16_t listen_port = 0;
     bool install_routes = true;
     vpn::netcfg::Ipv6Policy ipv6_policy = vpn::netcfg::Ipv6Policy::refuse;

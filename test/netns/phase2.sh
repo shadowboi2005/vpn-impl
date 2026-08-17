@@ -33,7 +33,7 @@ ROUTER_NS=vpn-router
 SERVER_NS=vpn-server
 NET_NS=vpn-net
 PORT=51820
-MTU=1380
+MTU=1420
 WEB_PORT=8080
 
 SERVER_UNDERLAY=10.0.0.1
@@ -226,24 +226,50 @@ ip -n "$CLIENT_NS" route show | sed 's/^/   /'
 
 # ------------------------------------------------------------ the real test ---
 
+# Starting a capture is not instant: tcpdump has to open the device, set
+# promiscuous mode and build the filter program, and a fixed sleep is a guess
+# about how long that takes. It announces "listening on ..." when it is actually
+# ready, so wait for that instead. Its stderr goes to a file rather than
+# /dev/null, because on exit it prints how many packets it captured and how many
+# the kernel dropped — which is the difference between "saw nothing" and "saw
+# them and lost them", and throwing it away turns a diagnosis into a guess.
+capture_pid=""
+start_capture() {  # <ns> <iface> <pcap> <log> <filter>
+    ip netns exec "$1" tcpdump -i "$2" -n -U --immediate-mode -w "$3" "$5" >"$4" 2>&1 &
+    capture_pid=$!
+    for _ in $(seq 1 80); do
+        grep -q "listening on" "$4" 2>/dev/null && return 0
+        kill -0 "$capture_pid" 2>/dev/null || break
+        sleep 0.1
+    done
+    printf '\033[31mtcpdump on %s in %s never became ready\033[0m\n' "$2" "$1" >&2
+    sed 's/^/   /' "$4" >&2
+    return 1
+}
+
 say "capturing on the internet side while the client asks who it is"
-ip netns exec "$NET_NS" tcpdump -i vpn-i -n -w "$logdir/internet.pcap" \
-    "tcp port $WEB_PORT" >/dev/null 2>&1 &
-tcpdump_pid=$!
+start_capture "$NET_NS" vpn-i "$logdir/internet.pcap" "$logdir/tcpdump-internet.txt" \
+    "tcp port $WEB_PORT" || true
+tcpdump_pid=$capture_pid
 # Also watch the underlay, to see what the tunnel itself is carrying.
-ip netns exec "$CLIENT_NS" tcpdump -i vpn-c -n -w "$logdir/underlay.pcap" \
-    "udp port $PORT" >/dev/null 2>&1 &
-underlay_pid=$!
-sleep 1
+start_capture "$CLIENT_NS" vpn-c "$logdir/underlay.pcap" "$logdir/tcpdump-underlay.txt" \
+    "udp port $PORT" || true
+underlay_pid=$capture_pid
 
 seen=$(ip netns exec "$CLIENT_NS" curl -s --max-time 8 "http://$INTERNET:$WEB_PORT/")
 curl_rc=$?
 note "the internet sees the client as: '${seen:-<nothing>}'"
 
 sleep 0.5
-kill "$tcpdump_pid" "$underlay_pid" 2>/dev/null
+# SIGINT rather than SIGTERM: it is the signal tcpdump answers by flushing and
+# printing its capture statistics.
+kill -INT "$tcpdump_pid" "$underlay_pid" 2>/dev/null
 wait "$tcpdump_pid" 2>/dev/null
 wait "$underlay_pid" 2>/dev/null
+
+say "what tcpdump itself says it saw"
+note "internet side: $(grep -E 'packets (captured|received|dropped)' "$logdir/tcpdump-internet.txt" | tr '\n' ' ')"
+note "underlay:      $(grep -E 'packets (captured|received|dropped)' "$logdir/tcpdump-underlay.txt" | tr '\n' ' ')"
 
 nat_ok=0
 if [ "$curl_rc" -eq 0 ] && [ "$seen" = "$SERVER_WAN" ]; then
@@ -252,16 +278,22 @@ fi
 
 say "independent confirmation from the capture"
 tcpdump -r "$logdir/internet.pcap" -n -c 4 2>/dev/null | sed 's/^/   /'
+internet_total=$(tcpdump -r "$logdir/internet.pcap" -n 2>/dev/null | wc -l)
 leaked=$(tcpdump -r "$logdir/internet.pcap" -n 2>/dev/null | grep -c '10\.9\.0\.')
-note "packets on the internet side still carrying a tunnel address: $leaked"
+note "$internet_total packets captured on the internet side, $leaked carrying a tunnel address"
+# "Nothing leaked" out of an empty capture is not evidence of anything. A single
+# HTTP request over TCP is a handshake, a request, a response and a teardown, so
+# anything below this means the capture missed traffic rather than that there
+# was none.
+[ "$internet_total" -ge 6 ] || note "WARNING: the capture looks truncated"
 
 say "a bigger transfer, to exercise something other than a single small request"
 bulk=$(ip netns exec "$CLIENT_NS" curl -s --max-time 8 -o /dev/null -w '%{http_code} %{size_download}' \
        "http://$INTERNET:$WEB_PORT/" 2>&1)
 note "second request: $bulk"
 
-say "MTU through the tunnel: 1352-byte payload, do-not-fragment"
-if ip netns exec "$CLIENT_NS" ping -c 2 -W 2 -M do -s 1352 10.9.0.1 >/dev/null; then
+say "MTU through the tunnel: $((MTU - 28))-byte payload, do-not-fragment"
+if ip netns exec "$CLIENT_NS" ping -c 2 -W 2 -M do -s "$((MTU - 28))" 10.9.0.1 >/dev/null; then
     mtu_ok=1
 else
     mtu_ok=0
@@ -274,14 +306,33 @@ tun_v6_server=$(ip -n "$SERVER_NS" -6 addr show dev tun0 2>/dev/null | grep -c i
 note "IPv6 addresses on tun0: client $tun_v6_client, server $tun_v6_server (want 0 and 0)"
 note "disable_ipv6 on the client's tun0: $(ip netns exec "$CLIENT_NS" cat /proc/sys/net/ipv6/conf/tun0/disable_ipv6 2>/dev/null)"
 
+say "Phase 3 framing, read off the wire"
+# The UDP payload is a transport-data message now, not a raw IP packet:
+#
+#   udp[8]        message type, must be 4
+#   udp[9..11]    reserved, must be zero
+#   udp[12..15]   receiver_index
+#   udp[16..23]   counter
+#   udp[24...]    the padded inner packet
+#
+# Asserting the type and reserved bytes here checks the encoder against
+# something that is not the decoder, which is the one thing the unit tests and
+# the fuzzer cannot do for each other.
+udp_total=$(tcpdump -r "$logdir/underlay.pcap" -n 2>/dev/null | wc -l)
+framed=$(tcpdump -r "$logdir/underlay.pcap" -n \
+    "udp[8] = 4 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0" 2>/dev/null | wc -l)
+note "$framed of $udp_total datagrams carry a well-formed transport-data header"
+echo "   first datagram, header and inner packet:"
+tcpdump -r "$logdir/underlay.pcap" -n -c 1 -X 2>/dev/null | head -8 | sed 's/^/   /'
+
 # Phase 1's capture caught tun0's own router solicitation being encapsulated and
-# sent down the tunnel. The UDP payload is a raw IP packet, so its first nibble
-# is the version: 4 is what belongs here, 6 is the leak.
-v6_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[8] & 0xf0 = 0x60" 2>/dev/null | wc -l)
-v4_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[8] & 0xf0 = 0x40" 2>/dev/null | wc -l)
+# sent down the tunnel. The inner packet's first nibble is its IP version: 4 is
+# what belongs here, 6 is the leak.
+v6_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x60" 2>/dev/null | wc -l)
+v4_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x40" 2>/dev/null | wc -l)
 note "packets inside the tunnel: $v4_inside IPv4, $v6_inside IPv6 (want 0 IPv6)"
 if [ "$v6_inside" -gt 0 ]; then
-    tcpdump -r "$logdir/underlay.pcap" -n -X "udp[8] & 0xf0 = 0x60" 2>/dev/null | head -8 | sed 's/^/   /'
+    tcpdump -r "$logdir/underlay.pcap" -n -X "udp[24] & 0xf0 = 0x60" 2>/dev/null | head -8 | sed 's/^/   /'
 fi
 
 say "iptables counters on the server"
@@ -454,7 +505,7 @@ status=0
 [ "$nat_ok" -eq 1 ]           || { echo "the internet did not see the server's address (got '$seen')"; status=1; }
 [ "$leaked" -eq 0 ]           || { echo "$leaked packets leaked a 10.9.0.x address past the NAT"; status=1; }
 [ "$loop_ok" -eq 1 ]          || { echo "the underlay route points into the tunnel — routing loop"; status=1; }
-[ "$mtu_ok" -eq 1 ]           || { echo "1352-byte ping through the tunnel FAILED"; status=1; }
+[ "$mtu_ok" -eq 1 ]           || { echo "large ping through the tunnel FAILED"; status=1; }
 [ "$routes_restored" -eq 1 ]  || { echo "client routes not restored on SIGINT"; status=1; }
 [ "$rules_removed" -eq 1 ]    || { echo "iptables rules not removed on SIGINT"; status=1; }
 [ "$server_forward_before" = "0" ]  || { echo "test setup: ip_forward should start at 0, was $server_forward_before"; status=1; }
@@ -467,6 +518,9 @@ status=0
 [ "$tun_v6_server" -eq 0 ]    || { echo "server tun0 has $tun_v6_server IPv6 addresses"; status=1; }
 [ "$v6_inside" -eq 0 ]        || { echo "$v6_inside IPv6 packets were carried inside the tunnel"; status=1; }
 [ "$v4_inside" -gt 0 ]        || { echo "no IPv4 seen inside the tunnel — the capture is wrong"; status=1; }
+[ "$udp_total" -ge 6 ]        || { echo "only $udp_total datagrams captured on the underlay — too few to conclude anything"; status=1; }
+[ "$internet_total" -ge 6 ]   || { echo "only $internet_total packets captured on the internet side — the leak check would be vacuous"; status=1; }
+[ "$framed" -eq "$udp_total" ] || { echo "$((udp_total - framed)) datagrams were not well-formed transport-data messages"; status=1; }
 [ "$v6_before" -eq 1 ]        || { echo "the IPv6 test setup itself does not work"; status=1; }
 [ "$refuse_ok" -eq 1 ]        || { echo "the client did not refuse to start on an IPv6-capable host"; status=1; }
 [ "$refuse_clean" -eq 1 ]     || { echo "refusing to start left state behind"; status=1; }

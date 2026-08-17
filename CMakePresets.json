@@ -21,10 +21,22 @@
         "CMAKE_CXX_COMPILER": "clang++",
         "VPN_SANITIZE": "OFF"
       }
+    },
+    {
+      "name": "fuzz",
+      "displayName": "clang, libFuzzer + ASan + UBSan",
+      "binaryDir": "${sourceDir}/build/fuzz",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "VPN_SANITIZE": "OFF",
+        "VPN_FUZZ": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "debug", "configurePreset": "debug" },
-    { "name": "release", "configurePreset": "release" }
+    { "name": "release", "configurePreset": "release" },
+    { "name": "fuzz", "configurePreset": "fuzz" }
   ]
 }

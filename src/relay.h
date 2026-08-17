@@ -19,6 +19,8 @@ struct RelayStats {
     uint64_t dropped_no_peer = 0;
     uint64_t dropped_send_failed = 0;
     uint64_t dropped_oversize = 0;
+    uint64_t dropped_malformed = 0;
+    uint64_t keepalives_received = 0;
     uint64_t endpoint_updates = 0;
 };
 

@@ -49,6 +49,7 @@ add_library(vpncore STATIC
   src/tun.cpp
   src/udp.cpp
   src/netcfg.cpp
+  src/wire.cpp
   src/relay.cpp)
 target_include_directories(vpncore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(vpncore PUBLIC vpn_flags)
@@ -58,3 +59,31 @@ target_link_libraries(vpnd PRIVATE vpncore)
 
 add_executable(vpn src/vpn.cpp)
 target_link_libraries(vpn PRIVATE vpncore)
+
+# ------------------------------------------------------------------- tests ---
+
+enable_testing()
+
+add_executable(wire_test test/unit/wire_test.cpp)
+target_include_directories(wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
+target_link_libraries(wire_test PRIVATE vpncore)
+add_test(NAME wire COMMAND wire_test)
+
+# libFuzzer is a clang feature. The fuzz target is opt-in rather than part of the
+# default build, because -fsanitize=fuzzer replaces main().
+option(VPN_FUZZ "build the libFuzzer harnesses (clang only)" OFF)
+
+if(VPN_FUZZ)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "VPN_FUZZ needs clang; ${CMAKE_CXX_COMPILER_ID} has no libFuzzer")
+  endif()
+  add_executable(decode_fuzz test/fuzz/decode_fuzz.cpp src/wire.cpp)
+  target_include_directories(decode_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(decode_fuzz PRIVATE
+    -Wall -Wextra -Wpedantic -Werror
+    -fsanitize=fuzzer,address,undefined
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=undefined)
+  target_link_options(decode_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_compile_definitions(decode_fuzz PRIVATE _GLIBCXX_ASSERTIONS)
+endif()

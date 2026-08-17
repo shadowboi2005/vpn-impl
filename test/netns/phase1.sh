@@ -18,7 +18,7 @@ set -uo pipefail
 CLIENT_NS=vpn-client
 SERVER_NS=vpn-server
 PORT=51820
-MTU=1380
+MTU=1420
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build_dir=${VPN_BUILD_DIR:-$repo_root/build/debug}
@@ -59,7 +59,7 @@ fi
 [ -x "$vpn" ]  || fail "$vpn not found — run: cmake --preset debug && cmake --build build/debug"
 
 mkdir -p "$logdir"
-rm -f "$logdir"/*.log "$logdir"/*.pcap
+rm -f "$logdir"/*.log "$logdir"/*.txt "$logdir"/*.pcap
 
 # Any leftovers from an interrupted run.
 teardown
@@ -116,8 +116,8 @@ ip -n "$SERVER_NS" link show tun0 >/dev/null 2>&1 || { cat "$logdir/vpnd.log"; f
 echo "both tun0 devices are up"
 
 say "capturing on the underlay while we ping"
-ip netns exec "$CLIENT_NS" tcpdump -i vpn-c -n -w "$logdir/underlay.pcap" \
-    "udp port $PORT" >/dev/null 2>&1 &
+ip netns exec "$CLIENT_NS" tcpdump -i vpn-c -n -U --immediate-mode -w "$logdir/underlay.pcap" \
+    "udp port $PORT" >"$logdir/tcpdump.txt" 2>&1 &
 tcpdump_pid=$!
 sleep 1
 
@@ -135,8 +135,8 @@ else
     reverse_ok=0
 fi
 
-say "MTU check: 1352-byte payload, do-not-fragment"
-if ip netns exec "$CLIENT_NS" ping -c 2 -W 2 -M do -s 1352 10.9.0.1 >/dev/null; then
+say "MTU check: $((MTU - 28))-byte payload, do-not-fragment"
+if ip netns exec "$CLIENT_NS" ping -c 2 -W 2 -M do -s "$((MTU - 28))" 10.9.0.1 >/dev/null; then
     mtu_ok=1
 else
     mtu_ok=0
@@ -144,17 +144,24 @@ fi
 echo "large packets: $([ $mtu_ok -eq 1 ] && echo ok || echo FAILED)"
 
 sleep 0.5
-kill "$tcpdump_pid" 2>/dev/null
+kill -INT "$tcpdump_pid" 2>/dev/null
 wait "$tcpdump_pid" 2>/dev/null
+grep -E "packets (captured|received|dropped)" "$logdir/tcpdump.txt" | sed "s/^/   /"
 
 say "what the underlay actually carried"
 tcpdump -r "$logdir/underlay.pcap" -n -c 4 2>/dev/null
 echo
-echo "first datagram, decoded as the raw IP packet it is:"
+# Since Phase 3 the payload is a transport-data message: a 16-byte header at
+# udp[8], then the padded inner packet at udp[24], then a 16-byte tag slot that
+# stays zero until Phase 5 fills it with a real Poly1305 tag.
+echo "first datagram — 16-byte header, then the inner packet still in the clear:"
 tcpdump -r "$logdir/underlay.pcap" -n -c 1 -X 2>/dev/null | head -12
 udp_count=$(tcpdump -r "$logdir/underlay.pcap" -n 2>/dev/null | wc -l)
+framed=$(tcpdump -r "$logdir/underlay.pcap" -n \
+    "udp[8] = 4 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0" 2>/dev/null | wc -l)
+inner_v4=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x40" 2>/dev/null | wc -l)
 echo
-echo "$udp_count UDP datagrams captured on the underlay"
+echo "$udp_count UDP datagrams captured; $framed well-formed, $inner_v4 carrying IPv4"
 
 say "shutting down on SIGINT"
 kill -INT "$vpnd_pid" "$vpn_pid" 2>/dev/null
@@ -170,8 +177,10 @@ say "result"
 status=0
 [ "$forward_ok" -eq 1 ] || { echo "client -> server ping FAILED"; status=1; }
 [ "$reverse_ok" -eq 1 ] || { echo "server -> client ping FAILED"; status=1; }
-[ "$mtu_ok"     -eq 1 ] || { echo "1352-byte ping FAILED"; status=1; }
-[ "$udp_count" -gt 0 ]  || { echo "no UDP seen on the underlay"; status=1; }
+[ "$mtu_ok"     -eq 1 ] || { echo "large ping FAILED"; status=1; }
+[ "$udp_count" -ge 16 ] || { echo "only $udp_count datagrams captured; 8 pings each way should give 20"; status=1; }
+[ "$framed" -eq "$udp_count" ] || { echo "$((udp_count - framed)) datagrams were not transport-data messages"; status=1; }
+[ "$inner_v4" -gt 0 ]   || { echo "no IPv4 found at the inner-packet offset"; status=1; }
 [ "$vpnd_rc" -eq 0 ]    || { echo "vpnd exited $vpnd_rc, expected 0"; status=1; }
 [ "$vpn_rc"  -eq 0 ]    || { echo "vpn exited $vpn_rc, expected 0"; status=1; }
 [ -z "$san_hits" ]      || { echo "sanitizer output in: $san_hits"; status=1; }
