@@ -1,6 +1,6 @@
 # vpn-impl
 
-A minimal but genuinely secure IPv4 VPN in C++20, built from scratch and modelled
+A minimal but secure IPv4 VPN in C++20, built from scratch and modelled
 on WireGuard.
 
 
