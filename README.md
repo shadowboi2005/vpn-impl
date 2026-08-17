@@ -1,11 +1,8 @@
 # vpn-impl
 
 A minimal but genuinely secure IPv4 VPN in C++20, built from scratch and modelled
-on WireGuard — same wire format, same handshake, same constants. Built one phase
-at a time; see [PLAN.md](PLAN.md) for the plan and the current state.
+on WireGuard.
 
-**This is a learning implementation. Do not carry traffic that matters with it.**
-The correct production answer is WireGuard itself.
 
 ---
 
@@ -30,7 +27,7 @@ silently build against a hash that is not there.
 sudo apt install cmake clang libsodium-dev
 ```
 
-Everything else — `ip`, `iptables`, `tcpdump`, `python3`, `curl` — is used only
+Everything else : `ip`, `iptables`, `tcpdump`, `python3`, `curl` — is used only
 by the test harnesses.
 
 ## Building
@@ -75,8 +72,7 @@ remove them.
 
 ## Running it for real
 
-Both binaries need `CAP_NET_ADMIN`, so root for now — dropping privileges is
-Phase 7.
+Both binaries need `CAP_NET_ADMIN`, so root for now 
 
 Server:
 
