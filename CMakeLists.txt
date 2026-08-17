@@ -45,14 +45,47 @@ if(VPN_SANITIZE)
   target_compile_definitions(vpn_flags INTERFACE _GLIBCXX_ASSERTIONS)
 endif()
 
+# ------------------------------------------------------------ dependencies ---
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(SODIUM REQUIRED IMPORTED_TARGET libsodium)
+
+# BLAKE2s. libsodium ships BLAKE2b, which is a different algorithm and not a
+# parameter you can set, so the hash comes from the BLAKE2 authors' own library,
+# vendored as a submodule.
+set(LIBB2_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third-party/libb2)
+if(NOT EXISTS ${LIBB2_DIR}/src/blake2s-ref.c)
+  message(FATAL_ERROR
+    "third-party/libb2 is empty. Run: git submodule update --init --recursive")
+endif()
+
+enable_language(C)
+
+# Only the reference implementation, not libb2's whole autotools build: it is
+# the one file we need, it is portable C, and the SIMD variants would drag in
+# runtime dispatch for a hash that runs a handful of times per handshake.
+add_library(blake2s STATIC ${LIBB2_DIR}/src/blake2s-ref.c)
+target_include_directories(blake2s SYSTEM PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/third-party/libb2-config
+  ${LIBB2_DIR}/src)
+# Someone else's code: instrument it like ours, but do not hold it to our
+# warning settings. -w rather than an exemption list, so an upstream change
+# never breaks our build.
+target_compile_options(blake2s PRIVATE -w)
+if(VPN_SANITIZE)
+  target_compile_options(blake2s PRIVATE -fsanitize=address,undefined -fno-omit-frame-pointer)
+  target_link_options(blake2s PUBLIC -fsanitize=address,undefined)
+endif()
+
 add_library(vpncore STATIC
   src/tun.cpp
   src/udp.cpp
   src/netcfg.cpp
   src/wire.cpp
+  src/crypto.cpp
   src/relay.cpp)
 target_include_directories(vpncore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
-target_link_libraries(vpncore PUBLIC vpn_flags)
+target_link_libraries(vpncore PUBLIC vpn_flags blake2s PkgConfig::SODIUM)
 
 add_executable(vpnd src/vpnd.cpp)
 target_link_libraries(vpnd PRIVATE vpncore)
@@ -68,6 +101,11 @@ add_executable(wire_test test/unit/wire_test.cpp)
 target_include_directories(wire_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
 target_link_libraries(wire_test PRIVATE vpncore)
 add_test(NAME wire COMMAND wire_test)
+
+add_executable(crypto_test test/unit/crypto_test.cpp)
+target_include_directories(crypto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
+target_link_libraries(crypto_test PRIVATE vpncore)
+add_test(NAME crypto COMMAND crypto_test)
 
 # libFuzzer is a clang feature. The fuzz target is opt-in rather than part of the
 # default build, because -fsanitize=fuzzer replaces main().
