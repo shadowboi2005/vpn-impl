@@ -92,13 +92,15 @@ export ASAN_OPTIONS=abort_on_error=1:detect_leaks=1
 export UBSAN_OPTIONS=print_stacktrace=1
 
 say "starting the tunnel"
+# --no-nat / --no-routes keep this a Phase 1 test: a bare tunnel and nothing
+# else. Phase 2's routing and NAT get their own harness.
 ip netns exec "$SERVER_NS" "$vpnd" \
-    --dev tun0 --tun-addr 10.9.0.1/24 --mtu "$MTU" --listen-port "$PORT" \
+    --dev tun0 --tun-addr 10.9.0.1/24 --mtu "$MTU" --listen-port "$PORT" --no-nat \
     >"$logdir/vpnd.log" 2>&1 &
 vpnd_pid=$!
 
 ip netns exec "$CLIENT_NS" "$vpn" \
-    --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "10.0.0.1:$PORT" \
+    --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "10.0.0.1:$PORT" --no-routes \
     >"$logdir/vpn.log" 2>&1 &
 vpn_pid=$!
 

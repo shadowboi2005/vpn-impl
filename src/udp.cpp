@@ -115,12 +115,16 @@ std::optional<sockaddr_in> parse_endpoint(std::string_view text) {
     return out;
 }
 
-std::string format_endpoint(const sockaddr_in& addr) {
+std::string format_address(const sockaddr_in& addr) {
     char text[INET_ADDRSTRLEN] = {};
     if (::inet_ntop(AF_INET, &addr.sin_addr, text, sizeof(text)) == nullptr) {
         return "<invalid>";
     }
-    return std::string(text) + ":" + std::to_string(ntohs(addr.sin_port));
+    return text;
+}
+
+std::string format_endpoint(const sockaddr_in& addr) {
+    return format_address(addr) + ":" + std::to_string(ntohs(addr.sin_port));
 }
 
 bool same_endpoint(const sockaddr_in& a, const sockaddr_in& b) {

@@ -40,6 +40,9 @@ std::optional<sockaddr_in> parse_endpoint(std::string_view text);
 
 std::string format_endpoint(const sockaddr_in& addr);
 
+// Just the dotted quad, without the port — what ip(8) wants in a route.
+std::string format_address(const sockaddr_in& addr);
+
 bool same_endpoint(const sockaddr_in& a, const sockaddr_in& b);
 
 }  // namespace vpn

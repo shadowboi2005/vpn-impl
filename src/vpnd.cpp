@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -18,7 +19,10 @@ void usage(const char* program) {
                  "  --dev NAME          tun device name (default tun0)\n"
                  "  --tun-addr CIDR     tunnel address (default 10.9.0.1/24)\n"
                  "  --mtu N             tunnel MTU, 576..1500 (default 1380)\n"
-                 "  --listen-port N     udp port to bind (default 51820)\n",
+                 "  --listen-port N     udp port to bind (default 51820)\n"
+                 "  --wan-if NAME       interface to masquerade out of\n"
+                 "                      (default: whichever reaches the internet)\n"
+                 "  --no-nat            do not forward or masquerade\n",
                  program);
 }
 
@@ -27,8 +31,10 @@ void usage(const char* program) {
 int main(int argc, char** argv) {
     std::string dev = "tun0";
     std::string tun_addr = "10.9.0.1/24";
+    std::string wan_if;
     int mtu = 1380;
     uint16_t listen_port = 51820;
+    bool install_nat = true;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
@@ -37,8 +43,12 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 0;
         }
+        if (flag == "--no-nat") {
+            install_nat = false;
+            continue;
+        }
         if (i + 1 >= argc) {
-            std::fprintf(stderr, "%s needs a value\n", argv[i]);
+            std::fprintf(stderr, "%s is not a known option, or needs a value\n", argv[i]);
             return 2;
         }
         const std::string_view value = argv[++i];
@@ -46,7 +56,13 @@ int main(int argc, char** argv) {
         if (flag == "--dev") {
             dev = value;
         } else if (flag == "--tun-addr") {
+            if (!vpn::netcfg::subnet_of(value).has_value()) {
+                std::fprintf(stderr, "bad --tun-addr (want IPv4/PREFIX, e.g. 10.9.0.1/24)\n");
+                return 2;
+            }
             tun_addr = value;
+        } else if (flag == "--wan-if") {
+            wan_if = value;
         } else if (flag == "--mtu") {
             if (const auto parsed = vpn::args::parse_mtu(value)) {
                 mtu = *parsed;
@@ -73,6 +89,19 @@ int main(int argc, char** argv) {
         vpn::netcfg::configure_interface(tun.name(), tun_addr, mtu);
 
         vpn::UdpSocket sock = vpn::UdpSocket::bind_any(listen_port);
+
+        // Outlives the packet loop, destroyed before the TUN device.
+        vpn::netcfg::ServerNat nat;
+        if (install_nat) {
+            if (wan_if.empty()) {
+                // Any routable address off our own subnets will do; nothing is
+                // sent to it.
+                wan_if = vpn::netcfg::route_to("1.1.1.1").dev;
+            }
+            // subnet_of already succeeded during argument parsing.
+            nat = vpn::netcfg::install_server_nat(tun.name(), *vpn::netcfg::subnet_of(tun_addr),
+                                                  wan_if);
+        }
 
         std::fprintf(stderr,
                      "vpnd: %s %s mtu %d, listening on udp/%u\n"
