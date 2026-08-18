@@ -44,6 +44,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build_dir=${VPN_BUILD_DIR:-$repo_root/build/debug}
 vpnd=$build_dir/vpnd
 vpn=$build_dir/vpn
+vpnkey=$build_dir/vpnkey
 logdir=${VPN_LOG_DIR:-$repo_root/build/phase2-logs}
 
 keep=0
@@ -55,6 +56,19 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+
+# Keys. Generated fresh per run and thrown away with the log directory; the
+# tunnel refuses to start without them, which is the point of Phase 5.
+gen_keys() {
+    "$vpnkey" genkey > "$logdir/client.key" && chmod 600 "$logdir/client.key"
+    "$vpnkey" genkey > "$logdir/server.key" && chmod 600 "$logdir/server.key"
+    "$vpnkey" pubkey < "$logdir/client.key" > "$logdir/client.pub"
+    "$vpnkey" pubkey < "$logdir/server.key" > "$logdir/server.pub"
+    CLIENT_PUB=$(cat "$logdir/client.pub")
+    SERVER_PUB=$(cat "$logdir/server.pub")
+    [ -n "$CLIENT_PUB" ] && [ -n "$SERVER_PUB" ] || fail "key generation failed"
+}
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 note() { printf '   %s\n' "$*"; }
@@ -79,6 +93,7 @@ if [ "$clean_only" -eq 1 ]; then
 fi
 
 [ -x "$vpnd" ] || fail "$vpnd not found — run: cmake --preset debug && cmake --build build/debug"
+[ -x "$vpnkey" ] || fail "$vpnkey not found — run: cmake --build build/debug"
 [ -x "$vpn" ]  || fail "$vpn not found — run: cmake --preset debug && cmake --build build/debug"
 command -v python3 >/dev/null || fail "python3 is needed for the stand-in web server"
 command -v curl    >/dev/null || fail "curl is needed"
@@ -89,6 +104,8 @@ rm -f "$logdir"/*.log "$logdir"/*.txt "$logdir"/*.pcap
 teardown  # any leftovers from an interrupted run
 
 # ---------------------------------------------------------------- topology ---
+
+gen_keys
 
 say "building the topology"
 for ns in "$CLIENT_NS" "$ROUTER_NS" "$SERVER_NS" "$NET_NS"; do
@@ -183,18 +200,23 @@ note "server ip_forward before: $server_forward_before"
 start_tunnel() {
     ip netns exec "$SERVER_NS" "$vpnd" \
         --dev tun0 --tun-addr 10.9.0.1/24 --mtu "$MTU" --listen-port "$PORT" \
+        --private-key "$logdir/server.key" --peer-key "$CLIENT_PUB" \
         >"$logdir/vpnd.log" 2>&1 &
     vpnd_pid=$!
 
     ip netns exec "$CLIENT_NS" "$vpn" \
         --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "$SERVER_UNDERLAY:$PORT" \
+        --private-key "$logdir/client.key" --peer-key "$SERVER_PUB" \
         >"$logdir/vpn.log" 2>&1 &
     vpn_pid=$!
 
     for _ in $(seq 1 50); do
         if ip -n "$CLIENT_NS" route show | grep -q '^0.0.0.0/1 ' &&
            ip netns exec "$SERVER_NS" iptables -t nat -S POSTROUTING | grep -q MASQUERADE; then
-            return 0
+            # Routes and rules are up; the session still needs a first packet to
+            # trigger the handshake, since this initiates on demand.
+            ip netns exec "$CLIENT_NS" ping -c 1 -W 2 10.9.0.1 >/dev/null 2>&1
+            grep -q "session established" "$logdir/vpnd.log" 2>/dev/null && return 0
         fi
         kill -0 "$vpnd_pid" 2>/dev/null || return 1
         kill -0 "$vpn_pid"  2>/dev/null || return 1
@@ -320,7 +342,7 @@ say "Phase 3 framing, read off the wire"
 # the fuzzer cannot do for each other.
 udp_total=$(tcpdump -r "$logdir/underlay.pcap" -n 2>/dev/null | wc -l)
 framed=$(tcpdump -r "$logdir/underlay.pcap" -n \
-    "udp[8] = 4 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0" 2>/dev/null | wc -l)
+    "udp[8] >= 1 and udp[8] <= 4 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0" 2>/dev/null | wc -l)
 note "$framed of $udp_total datagrams carry a well-formed transport-data header"
 echo "   first datagram, header and inner packet:"
 tcpdump -r "$logdir/underlay.pcap" -n -c 1 -X 2>/dev/null | head -8 | sed 's/^/   /'
@@ -328,12 +350,12 @@ tcpdump -r "$logdir/underlay.pcap" -n -c 1 -X 2>/dev/null | head -8 | sed 's/^/ 
 # Phase 1's capture caught tun0's own router solicitation being encapsulated and
 # sent down the tunnel. The inner packet's first nibble is its IP version: 4 is
 # what belongs here, 6 is the leak.
-v6_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x60" 2>/dev/null | wc -l)
-v4_inside=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x40" 2>/dev/null | wc -l)
-note "packets inside the tunnel: $v4_inside IPv4, $v6_inside IPv6 (want 0 IPv6)"
-if [ "$v6_inside" -gt 0 ]; then
-    tcpdump -r "$logdir/underlay.pcap" -n -X "udp[24] & 0xf0 = 0x60" 2>/dev/null | head -8 | sed 's/^/   /'
-fi
+# Since Phase 5 the inner packet is ciphertext, so it can no longer be read off
+# the wire. What tun0 carries is checked at the interface instead.
+v6_inside=$(ip netns exec "$CLIENT_NS" cat /proc/net/dev_snmp6/tun0 2>/dev/null \
+    | awk '/Ip6OutRequests/ {print $2}')
+v6_inside=${v6_inside:-0}
+note "IPv6 packets tun0 tried to send: $v6_inside (want 0)"
 
 say "iptables counters on the server"
 ip netns exec "$SERVER_NS" iptables -t nat -L POSTROUTING -n -v | sed 's/^/   /'
@@ -404,6 +426,7 @@ note "client can reach 2001:db8:1::1 over IPv6: $([ $v6_before -eq 1 ] && echo y
 say "default policy must refuse to start rather than leak"
 ip netns exec "$CLIENT_NS" "$vpn" \
     --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "$SERVER_UNDERLAY:$PORT" \
+    --private-key "$logdir/client.key" --peer-key "$SERVER_PUB" \
     >"$logdir/vpn-refuse.log" 2>&1
 refuse_rc=$?
 sed 's/^/   /' "$logdir/vpn-refuse.log"
@@ -422,16 +445,25 @@ note "nothing left behind by the refusal: $([ $refuse_clean -eq 1 ] && echo yes 
 say "--host-ipv6 block: bring the tunnel up with v6 firewalled off"
 ip netns exec "$SERVER_NS" "$vpnd" \
     --dev tun0 --tun-addr 10.9.0.1/24 --mtu "$MTU" --listen-port "$PORT" \
+    --private-key "$logdir/server.key" --peer-key "$CLIENT_PUB" \
     >"$logdir/vpnd-v6.log" 2>&1 &
 vpnd6_pid=$!
 ip netns exec "$CLIENT_NS" "$vpn" \
     --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "$SERVER_UNDERLAY:$PORT" \
-    --host-ipv6 block >"$logdir/vpn-block.log" 2>&1 &
+    --private-key "$logdir/client.key" --peer-key "$SERVER_PUB" --host-ipv6 block >"$logdir/vpn-block.log" 2>&1 &
 vpn6_pid=$!
 
 for _ in $(seq 1 50); do
     ip netns exec "$CLIENT_NS" ip6tables -S OUTPUT 2>/dev/null | grep -q REJECT && break
     sleep 0.1
+done
+# The handshake is on demand, so the session needs a packet to trigger it.
+# Without this the curl below would spend its first SYN doing that, and a slow
+# retransmit would look like a broken tunnel.
+for _ in $(seq 1 30); do
+    ip netns exec "$CLIENT_NS" ping -c 1 -W 1 10.9.0.1 >/dev/null 2>&1
+    grep -q "session established" "$logdir/vpnd-v6.log" 2>/dev/null && break
+    sleep 0.2
 done
 echo "   ip6tables in the client namespace:"
 ip netns exec "$CLIENT_NS" ip6tables -S | sed 's/^/     /'
@@ -517,7 +549,6 @@ status=0
 [ "$tun_v6_client" -eq 0 ]    || { echo "client tun0 has $tun_v6_client IPv6 addresses"; status=1; }
 [ "$tun_v6_server" -eq 0 ]    || { echo "server tun0 has $tun_v6_server IPv6 addresses"; status=1; }
 [ "$v6_inside" -eq 0 ]        || { echo "$v6_inside IPv6 packets were carried inside the tunnel"; status=1; }
-[ "$v4_inside" -gt 0 ]        || { echo "no IPv4 seen inside the tunnel — the capture is wrong"; status=1; }
 [ "$udp_total" -ge 6 ]        || { echo "only $udp_total datagrams captured on the underlay — too few to conclude anything"; status=1; }
 [ "$internet_total" -ge 6 ]   || { echo "only $internet_total packets captured on the internet side — the leak check would be vacuous"; status=1; }
 [ "$framed" -eq "$udp_total" ] || { echo "$((udp_total - framed)) datagrams were not well-formed transport-data messages"; status=1; }

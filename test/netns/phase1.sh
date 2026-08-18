@@ -1,6 +1,9 @@
 #!/bin/bash
-# Phase 1 acceptance test: a bare, unencrypted tunnel between two network
-# namespaces.
+# Phase 1 acceptance test: packets flow both ways through the tunnel.
+#
+# Kept as the smallest end-to-end test in the tree. Since Phase 5 the tunnel
+# is encrypted, so this also checks that nothing it carries is readable on
+# the wire; the replay and forgery tests live in phase5.sh.
 #
 #   client ns  10.0.0.2/24 ──veth── 10.0.0.1/24  server ns
 #     tun0 10.9.0.2/24                 tun0 10.9.0.1/24
@@ -24,6 +27,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 build_dir=${VPN_BUILD_DIR:-$repo_root/build/debug}
 vpnd=$build_dir/vpnd
 vpn=$build_dir/vpn
+vpnkey=$build_dir/vpnkey
 logdir=${VPN_LOG_DIR:-$repo_root/build/phase1-logs}
 
 keep=0
@@ -35,6 +39,19 @@ for arg in "$@"; do
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
+
+
+# Keys. Generated fresh per run and thrown away with the log directory; the
+# tunnel refuses to start without them, which is the point of Phase 5.
+gen_keys() {
+    "$vpnkey" genkey > "$logdir/client.key" && chmod 600 "$logdir/client.key"
+    "$vpnkey" genkey > "$logdir/server.key" && chmod 600 "$logdir/server.key"
+    "$vpnkey" pubkey < "$logdir/client.key" > "$logdir/client.pub"
+    "$vpnkey" pubkey < "$logdir/server.key" > "$logdir/server.pub"
+    CLIENT_PUB=$(cat "$logdir/client.pub")
+    SERVER_PUB=$(cat "$logdir/server.pub")
+    [ -n "$CLIENT_PUB" ] && [ -n "$SERVER_PUB" ] || fail "key generation failed"
+}
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
@@ -56,6 +73,7 @@ if [ "$clean_only" -eq 1 ]; then
 fi
 
 [ -x "$vpnd" ] || fail "$vpnd not found — run: cmake --preset debug && cmake --build build/debug"
+[ -x "$vpnkey" ] || fail "$vpnkey not found — run: cmake --build build/debug"
 [ -x "$vpn" ]  || fail "$vpn not found — run: cmake --preset debug && cmake --build build/debug"
 
 mkdir -p "$logdir"
@@ -63,6 +81,8 @@ rm -f "$logdir"/*.log "$logdir"/*.txt "$logdir"/*.pcap
 
 # Any leftovers from an interrupted run.
 teardown
+
+gen_keys
 
 say "creating namespaces"
 ip netns add "$CLIENT_NS" || fail "ip netns add $CLIENT_NS"
@@ -96,11 +116,13 @@ say "starting the tunnel"
 # else. Phase 2's routing and NAT get their own harness.
 ip netns exec "$SERVER_NS" "$vpnd" \
     --dev tun0 --tun-addr 10.9.0.1/24 --mtu "$MTU" --listen-port "$PORT" --no-nat \
+    --private-key "$logdir/server.key" --peer-key "$CLIENT_PUB" \
     >"$logdir/vpnd.log" 2>&1 &
 vpnd_pid=$!
 
 ip netns exec "$CLIENT_NS" "$vpn" \
     --dev tun0 --tun-addr 10.9.0.2/24 --mtu "$MTU" --server "10.0.0.1:$PORT" --no-routes \
+    --private-key "$logdir/client.key" --peer-key "$SERVER_PUB" \
     >"$logdir/vpn.log" 2>&1 &
 vpn_pid=$!
 
@@ -122,14 +144,14 @@ tcpdump_pid=$!
 sleep 1
 
 say "client -> server: ping 10.9.0.1"
-if ip netns exec "$CLIENT_NS" ping -c 5 -i 0.3 -W 2 10.9.0.1; then
+if ip netns exec "$CLIENT_NS" ping -c 5 -i 0.3 -W 2 -p cafebabe 10.9.0.1; then
     forward_ok=1
 else
     forward_ok=0
 fi
 
 say "server -> client: ping 10.9.0.2 (works only once the endpoint is learned)"
-if ip netns exec "$SERVER_NS" ping -c 3 -i 0.3 -W 2 10.9.0.2; then
+if ip netns exec "$SERVER_NS" ping -c 3 -i 0.3 -W 2 -p cafebabe 10.9.0.2; then
     reverse_ok=1
 else
     reverse_ok=0
@@ -151,17 +173,27 @@ grep -E "packets (captured|received|dropped)" "$logdir/tcpdump.txt" | sed "s/^/ 
 say "what the underlay actually carried"
 tcpdump -r "$logdir/underlay.pcap" -n -c 4 2>/dev/null
 echo
-# Since Phase 3 the payload is a transport-data message: a 16-byte header at
-# udp[8], then the padded inner packet at udp[24], then a 16-byte tag slot that
-# stays zero until Phase 5 fills it with a real Poly1305 tag.
-echo "first datagram — 16-byte header, then the inner packet still in the clear:"
+# The payload is a transport-data message: a 16-byte header at udp[8], then
+# the sealed inner packet, then its 16-byte Poly1305 tag.
+echo "first datagram — 16-byte header, then ciphertext:"
 tcpdump -r "$logdir/underlay.pcap" -n -c 1 -X 2>/dev/null | head -12
 udp_count=$(tcpdump -r "$logdir/underlay.pcap" -n 2>/dev/null | wc -l)
-framed=$(tcpdump -r "$logdir/underlay.pcap" -n \
-    "udp[8] = 4 and udp[9] = 0 and udp[10] = 0 and udp[11] = 0" 2>/dev/null | wc -l)
-inner_v4=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[24] & 0xf0 = 0x40" 2>/dev/null | wc -l)
+initiations=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[8] = 1" 2>/dev/null | wc -l)
+responses=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[8] = 2" 2>/dev/null | wc -l)
+transport=$(tcpdump -r "$logdir/underlay.pcap" -n "udp[8] = 4" 2>/dev/null | wc -l)
+bad_reserved=$(tcpdump -r "$logdir/underlay.pcap" -n \
+    "udp[9] != 0 or udp[10] != 0 or udp[11] != 0" 2>/dev/null | wc -l)
 echo
-echo "$udp_count UDP datagrams captured; $framed well-formed, $inner_v4 carrying IPv4"
+echo "$udp_count datagrams: $initiations initiation, $responses response, $transport transport"
+echo "$bad_reserved with a nonzero reserved field (want 0)"
+
+# The ping payload is the repeating pattern cafebabe. If any of it appears in
+# the bytes on the wire, the tunnel is not encrypting.
+plaintext_hits=$(python3 -c "
+import sys
+print(open(sys.argv[1], 'rb').read().count(bytes.fromhex('cafebabecafebabe')))
+" "$logdir/underlay.pcap")
+echo "occurrences of the ping payload in the captured bytes: $plaintext_hits (want 0)"
 
 say "shutting down on SIGINT"
 kill -INT "$vpnd_pid" "$vpn_pid" 2>/dev/null
@@ -178,15 +210,18 @@ status=0
 [ "$forward_ok" -eq 1 ] || { echo "client -> server ping FAILED"; status=1; }
 [ "$reverse_ok" -eq 1 ] || { echo "server -> client ping FAILED"; status=1; }
 [ "$mtu_ok"     -eq 1 ] || { echo "large ping FAILED"; status=1; }
-[ "$udp_count" -ge 16 ] || { echo "only $udp_count datagrams captured; 8 pings each way should give 20"; status=1; }
-[ "$framed" -eq "$udp_count" ] || { echo "$((udp_count - framed)) datagrams were not transport-data messages"; status=1; }
-[ "$inner_v4" -gt 0 ]   || { echo "no IPv4 found at the inner-packet offset"; status=1; }
+[ "$udp_count" -ge 16 ] || { echo "only $udp_count datagrams captured"; status=1; }
+[ "$transport" -ge 16 ] || { echo "only $transport transport packets; 8 pings each way should give 20"; status=1; }
+[ "$initiations" -ge 1 ] || { echo "no handshake initiation on the wire"; status=1; }
+[ "$responses" -ge 1 ]  || { echo "no handshake response on the wire"; status=1; }
+[ "$bad_reserved" -eq 0 ] || { echo "$bad_reserved datagrams had a nonzero reserved field"; status=1; }
+[ "$plaintext_hits" -eq 0 ] || { echo "the ping payload appears $plaintext_hits times in the clear"; status=1; }
 [ "$vpnd_rc" -eq 0 ]    || { echo "vpnd exited $vpnd_rc, expected 0"; status=1; }
 [ "$vpn_rc"  -eq 0 ]    || { echo "vpn exited $vpn_rc, expected 0"; status=1; }
 [ -z "$san_hits" ]      || { echo "sanitizer output in: $san_hits"; status=1; }
 
 if [ "$status" -eq 0 ]; then
-    printf '\033[32mPHASE 1 PASS\033[0m — packets flow both ways, clean under ASan/UBSan\n'
+    printf '\033[32mPHASE 1 PASS\033[0m — packets flow both ways, encrypted, clean under ASan/UBSan\n'
 else
     printf '\033[31mPHASE 1 FAIL\033[0m — see above; logs in %s\n' "$logdir"
 fi

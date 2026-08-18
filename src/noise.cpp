@@ -1,8 +1,14 @@
 #include "noise.h"
 
+#include <sodium.h>
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <array>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <string>
 #include <string_view>
 
 #include "wire.h"
@@ -135,6 +141,41 @@ std::unique_ptr<Identity> Identity::from_base64(std::string_view private_key,
     }
     return std::make_unique<Identity>(crypto::Key(priv->data(), crypto::kKeySize),
                                       crypto::Key(pub->data(), crypto::kKeySize));
+}
+
+std::unique_ptr<Identity> load_identity(const std::string& private_key_path,
+                                       std::string_view peer_public_base64) {
+    struct stat info {};
+    if (::stat(private_key_path.c_str(), &info) != 0) {
+        std::fprintf(stderr, "cannot read %s\n", private_key_path.c_str());
+        return nullptr;
+    }
+    if ((info.st_mode & (S_IRWXG | S_IRWXO)) != 0) {
+        // Not fatal — it is the operator's key and their call — but silence
+        // here would mean a world-readable private key nobody ever noticed.
+        std::fprintf(stderr, "warning: %s is readable by more than its owner (mode %04o)\n",
+                     private_key_path.c_str(), static_cast<unsigned>(info.st_mode & 07777));
+    }
+
+    std::ifstream file(private_key_path);
+    if (!file) {
+        std::fprintf(stderr, "cannot open %s\n", private_key_path.c_str());
+        return nullptr;
+    }
+    std::string line;
+    std::getline(file, line);
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) {
+        line.pop_back();
+    }
+
+    std::unique_ptr<Identity> identity = Identity::from_base64(line, peer_public_base64);
+    // The line held a private key; std::string makes no promise to wipe itself.
+    ::sodium_memzero(line.data(), line.size());
+    if (identity == nullptr) {
+        std::fprintf(stderr, "%s or the peer key is not a valid base64 32-byte key\n",
+                     private_key_path.c_str());
+    }
+    return identity;
 }
 
 // ------------------------------------------------------------ TimestampGuard

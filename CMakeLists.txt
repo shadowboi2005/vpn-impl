@@ -83,6 +83,8 @@ add_library(vpncore STATIC
   src/netcfg.cpp
   src/wire.cpp
   src/crypto.cpp
+  src/noise.cpp
+  src/session.cpp
   src/relay.cpp)
 target_include_directories(vpncore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(vpncore PUBLIC vpn_flags blake2s PkgConfig::SODIUM)
@@ -92,6 +94,9 @@ target_link_libraries(vpnd PRIVATE vpncore)
 
 add_executable(vpn src/vpn.cpp)
 target_link_libraries(vpn PRIVATE vpncore)
+
+add_executable(vpnkey src/vpnkey.cpp)
+target_link_libraries(vpnkey PRIVATE vpncore)
 
 # ------------------------------------------------------------------- tests ---
 
@@ -106,6 +111,16 @@ add_executable(crypto_test test/unit/crypto_test.cpp)
 target_include_directories(crypto_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
 target_link_libraries(crypto_test PRIVATE vpncore)
 add_test(NAME crypto COMMAND crypto_test)
+
+add_executable(noise_test test/unit/noise_test.cpp)
+target_include_directories(noise_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
+target_link_libraries(noise_test PRIVATE vpncore)
+add_test(NAME noise COMMAND noise_test)
+
+add_executable(session_test test/unit/session_test.cpp)
+target_include_directories(session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test/unit)
+target_link_libraries(session_test PRIVATE vpncore)
+add_test(NAME session COMMAND session_test)
 
 # libFuzzer is a clang feature. The fuzz target is opt-in rather than part of the
 # default build, because -fsanitize=fuzzer replaces main().
@@ -124,4 +139,28 @@ if(VPN_FUZZ)
     -fno-sanitize-recover=undefined)
   target_link_options(decode_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
   target_compile_definitions(decode_fuzz PRIVATE _GLIBCXX_ASSERTIONS)
+
+  add_executable(handshake_fuzz test/fuzz/handshake_fuzz.cpp
+    src/wire.cpp src/crypto.cpp src/noise.cpp)
+  target_include_directories(handshake_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(handshake_fuzz PRIVATE
+    -Wall -Wextra -Wpedantic -Werror
+    -fsanitize=fuzzer,address,undefined
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=undefined)
+  target_link_options(handshake_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_compile_definitions(handshake_fuzz PRIVATE _GLIBCXX_ASSERTIONS)
+  target_link_libraries(handshake_fuzz PRIVATE blake2s PkgConfig::SODIUM)
+
+  add_executable(session_fuzz test/fuzz/session_fuzz.cpp
+    src/wire.cpp src/crypto.cpp src/noise.cpp src/session.cpp)
+  target_include_directories(session_fuzz PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_compile_options(session_fuzz PRIVATE
+    -Wall -Wextra -Wpedantic -Werror
+    -fsanitize=fuzzer,address,undefined
+    -fno-omit-frame-pointer
+    -fno-sanitize-recover=undefined)
+  target_link_options(session_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+  target_compile_definitions(session_fuzz PRIVATE _GLIBCXX_ASSERTIONS)
+  target_link_libraries(session_fuzz PRIVATE blake2s PkgConfig::SODIUM)
 endif()

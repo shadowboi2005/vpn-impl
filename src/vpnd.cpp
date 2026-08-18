@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -9,6 +10,8 @@
 #include "netcfg.h"
 #include "relay.h"
 #include "tun.h"
+#include "crypto.h"
+#include "noise.h"
 #include "udp.h"
 #include "wire.h"
 
@@ -23,6 +26,8 @@ void usage(const char* program) {
                  "  --listen-port N     udp port to bind (default 51820)\n"
                  "  --wan-if NAME       interface to masquerade out of\n"
                  "                      (default: whichever reaches the internet)\n"
+                 "  --private-key PATH  our private key, base64 (required)\n"
+                 "  --peer-key BASE64   the client's public key (required)\n"
                  "  --no-nat            do not forward or masquerade\n",
                  program);
 }
@@ -36,6 +41,8 @@ int main(int argc, char** argv) {
     int mtu = vpn::wire::kDefaultTunnelMtu;
     uint16_t listen_port = 51820;
     bool install_nat = true;
+    std::string private_key_path;
+    std::string peer_key;
 
     for (int i = 1; i < argc; ++i) {
         const std::string_view flag = argv[i];
@@ -64,6 +71,10 @@ int main(int argc, char** argv) {
             tun_addr = value;
         } else if (flag == "--wan-if") {
             wan_if = value;
+        } else if (flag == "--private-key") {
+            private_key_path = value;
+        } else if (flag == "--peer-key") {
+            peer_key = value;
         } else if (flag == "--mtu") {
             if (const auto parsed = vpn::args::parse_mtu(value)) {
                 mtu = *parsed;
@@ -85,7 +96,20 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (private_key_path.empty() || peer_key.empty()) {
+        std::fprintf(stderr, "--private-key and --peer-key are both required\n");
+        usage(argv[0]);
+        return 2;
+    }
+
     try {
+        vpn::crypto::init();
+        const std::unique_ptr<vpn::noise::Identity> identity =
+            vpn::noise::load_identity(private_key_path, peer_key);
+        if (identity == nullptr) {
+            return 1;
+        }
+
         vpn::TunDevice tun = vpn::TunDevice::open(dev);
         vpn::netcfg::configure_interface(tun.name(), tun_addr, mtu);
 
@@ -109,11 +133,13 @@ int main(int argc, char** argv) {
                      "vpnd: no peer yet — the client has to send first\n",
                      tun.name().c_str(), tun_addr.c_str(), mtu, sock.local_port());
 
-        const vpn::RelayStats stats = vpn::run_relay(tun, sock, vpn::RelayConfig{
-                                                                   .mtu = mtu,
-                                                                   .peer = std::nullopt,
-                                                                   .learn_peer = true,
-                                                               });
+        const vpn::RelayStats stats = vpn::run_relay(tun, sock,
+                                                     vpn::RelayConfig{
+                                                         .mtu = mtu,
+                                                         .role = vpn::Role::responder,
+                                                         .peer = std::nullopt,
+                                                         .identity = identity.get(),
+                                                     });
         vpn::print_stats(stderr, stats);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "vpnd: %s\n", error.what());

@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "crypto.h"
@@ -68,6 +69,16 @@ private:
     std::array<uint8_t, crypto::kKeySize> own_mac1_key_{};
     std::array<uint8_t, crypto::kKeySize> peer_mac1_key_{};
 };
+
+// Loads a private key from a file — base64, one line, exactly as `wg` writes
+// one — and the peer's public key from a base64 string. Public keys are not
+// secret, so passing one on a command line is fine; private keys are, so that
+// one comes from a file.
+//
+// Nullptr on any problem, with the reason on stderr. Warns, but does not
+// refuse, if the key file is readable by anyone but its owner.
+std::unique_ptr<Identity> load_identity(const std::string& private_key_path,
+                                        std::string_view peer_public_base64);
 
 // The handshake replay defence.
 //

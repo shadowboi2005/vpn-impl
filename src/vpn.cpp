@@ -2,14 +2,17 @@
 #include <cstdlib>
 #include <exception>
 #include <optional>
-#include <string>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 #include "args.h"
 #include "netcfg.h"
 #include "relay.h"
 #include "tun.h"
+#include "crypto.h"
+#include "noise.h"
 #include "udp.h"
 #include "wire.h"
 
@@ -23,6 +26,8 @@ void usage(const char* program) {
                  "  --tun-addr CIDR     tunnel address (default 10.9.0.2/24)\n"
                  "  --mtu N             tunnel MTU, 576..1500 (default 1420)\n"
                  "  --listen-port N     local udp port (default 0, ephemeral)\n"
+                 "  --private-key PATH  our private key, base64 (required)\n"
+                 "  --peer-key BASE64   the server's public key (required)\n"
                  "  --no-routes         do not touch the routing table\n"
                  "  --host-ipv6 MODE    what to do if this host has working IPv6:\n"
                  "                      refuse (default) | block | ignore\n",
@@ -38,6 +43,8 @@ int main(int argc, char** argv) {
     uint16_t listen_port = 0;
     bool install_routes = true;
     vpn::netcfg::Ipv6Policy ipv6_policy = vpn::netcfg::Ipv6Policy::refuse;
+    std::string private_key_path;
+    std::string peer_key;
     std::optional<sockaddr_in> server;
 
     for (int i = 1; i < argc; ++i) {
@@ -78,6 +85,10 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "bad --host-ipv6 (want refuse, block or ignore)\n");
                 return 2;
             }
+        } else if (flag == "--private-key") {
+            private_key_path = value;
+        } else if (flag == "--peer-key") {
+            peer_key = value;
         } else if (flag == "--mtu") {
             if (const auto parsed = vpn::args::parse_mtu(value)) {
                 mtu = *parsed;
@@ -104,9 +115,22 @@ int main(int argc, char** argv) {
         usage(argv[0]);
         return 2;
     }
+    if (private_key_path.empty() || peer_key.empty()) {
+        std::fprintf(stderr, "--private-key and --peer-key are both required\n");
+        usage(argv[0]);
+        return 2;
+    }
 
     try {
-        // First, before any state exists to unwind. This tunnel is IPv4-only, so
+        vpn::crypto::init();
+        // Before anything else: no keys, no tunnel, and nothing to unwind.
+        const std::unique_ptr<vpn::noise::Identity> identity =
+            vpn::noise::load_identity(private_key_path, peer_key);
+        if (identity == nullptr) {
+            return 1;
+        }
+
+        // Next, before any state exists to unwind. This tunnel is IPv4-only, so
         // a host that can route IPv6 has a complete way around it: every name
         // with a AAAA record is reached outside the tunnel, in the clear, from
         // the real address. Declared before the TUN device so the block, if
@@ -151,11 +175,13 @@ int main(int argc, char** argv) {
                      tun_addr.c_str(), mtu, sock.local_port(),
                      vpn::format_endpoint(*server).c_str());
 
-        const vpn::RelayStats stats = vpn::run_relay(tun, sock, vpn::RelayConfig{
-                                                                   .mtu = mtu,
-                                                                   .peer = server,
-                                                                   .learn_peer = false,
-                                                               });
+        const vpn::RelayStats stats = vpn::run_relay(tun, sock,
+                                                     vpn::RelayConfig{
+                                                         .mtu = mtu,
+                                                         .role = vpn::Role::initiator,
+                                                         .peer = server,
+                                                         .identity = identity.get(),
+                                                     });
         vpn::print_stats(stderr, stats);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "vpn: %s\n", error.what());
